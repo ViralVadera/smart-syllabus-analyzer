@@ -29,7 +29,7 @@ You'll also need:
 
 1. Clone the repository:
 ```bash
-git clone https://github.com/yourusername/smart-syllabus-analyzer.git
+git clone https://github.com/ViralVadera/smart-syllabus-analyzer.git
 cd smart-syllabus-analyzer
 ```
 
