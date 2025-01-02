@@ -47,6 +47,10 @@ pip install pymupdf4llm requests youtube-searc
 python syllabus_analyzer.py
 ```
 
+## Performance Disclaimer
+
+Heads up: The analysis might take longer than you'd expect. The code isn't the fastest thing around (it's more like a tortoise than a hare), especially for large or complicated syllabi. So, it might be slow, but trust me, it'll be worth the wait.
+
 ## Output
 
 The tool generates two types of output files:
