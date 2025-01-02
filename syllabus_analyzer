@@ -7,6 +7,10 @@ import requests
 from youtube_search import YoutubeSearch
 from dataclasses import dataclass
 from time import sleep
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import hashlib
+import pickle
+from pathlib import Path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -28,22 +32,53 @@ class TopicContent:
     recommended_resources: List[str]
     videos: List[VideoContent]
 
+class Cache:
+    def __init__(self, cache_dir: str = ".cache"):
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+    
+    def _get_cache_key(self, data: str) -> str:
+        return hashlib.md5(data.encode()).hexdigest()
+    
+    def get(self, key: str) -> Optional[any]:
+        cache_file = self.cache_dir / f"{self._get_cache_key(key)}.pkl"
+        if cache_file.exists():
+            try:
+                with open(cache_file, 'rb') as f:
+                    return pickle.load(f)
+            except: pass
+        return None
+    
+    def set(self, key: str, value: any):
+        cache_file = self.cache_dir / f"{self._get_cache_key(key)}.pkl"
+        with open(cache_file, 'wb') as f:
+            pickle.dump(value, f)
+
 class SyllabusProcessor:
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, max_workers: int = 4):
         self.api_key = api_key
         self.gemini_url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent"
-    
+        self.cache = Cache()
+        self.max_workers = max_workers
+
     def extract_text_from_pdf(self, pdf_path: str) -> Optional[str]:
+        cache_key = f"pdf_{pdf_path}"
+        if cached := self.cache.get(cache_key):
+            return cached
         try:
-            if not os.path.exists(pdf_path): raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+            if not os.path.exists(pdf_path): raise FileNotFoundError(f"PDF not found: {pdf_path}")
             md_text = pymupdf4llm.to_markdown(pdf_path)
-            logging.info(f"Extracted {len(md_text)} characters")
+            self.cache.set(cache_key, md_text)
             return md_text
         except Exception as e:
             logging.error(f"PDF extraction error: {str(e)}")
             return None
 
     def query_gemini(self, prompt: str, max_retries: int = 3) -> Optional[str]:
+        cache_key = f"gemini_{prompt}"
+        if cached := self.cache.get(cache_key):
+            return cached
+        
         for attempt in range(max_retries):
             try:
                 response = requests.post(
@@ -53,61 +88,72 @@ class SyllabusProcessor:
                     timeout=30
                 )
                 response.raise_for_status()
-                data = response.json()
-                if content := data.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', ''):
+                if content := response.json().get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', ''):
+                    self.cache.set(cache_key, content)
                     return content
             except requests.exceptions.RequestException as e:
-                if attempt < max_retries - 1: sleep(2 ** attempt)
-                continue
+                if attempt < max_retries - 1: sleep(1)
         return None
 
-    def get_detailed_topic_content(self, topic: str, description: str) -> Dict:
+    def process_topic_content(self, topic: str, description: str) -> Dict:
         prompts = {
-            "learning_objectives": f"List 5-7 specific learning objectives for the topic: {topic}\nDescription: {description}\nFormat as a list.",
-            "key_concepts": f"List 8-10 key concepts and terminology related to: {topic}\nDescription: {description}\nFormat as a list.",
-            "practical_applications": f"List 5-7 practical applications of: {topic}\nDescription: {description}\nFormat as a list.",
-            "related_topics": f"List 6-8 related topics connected to: {topic}\nDescription: {description}\nFormat as a list.",
-            "recommended_resources": f"List 5-7 learning resources for: {topic}\nDescription: {description}\nFormat as a list."
+            "learning_objectives": f"List 5-7 specific learning objectives for: {topic}",
+            "key_concepts": f"List 8-10 key concepts for: {topic}",
+            "practical_applications": f"List 5-7 practical applications of: {topic}",
+            "related_topics": f"List 6-8 related topics to: {topic}",
+            "recommended_resources": f"List 5-7 learning resources for: {topic}"
         }
+        
         results = {}
-        for key, prompt in prompts.items():
-            if response := self.query_gemini(prompt):
-                results[key] = [item.strip('- ') for item in response.split('\n') if item.strip('- ')]
-            else:
-                results[key] = []
-            sleep(1)
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_key = {
+                executor.submit(self.query_gemini, prompt): key 
+                for key, prompt in prompts.items()
+            }
+            
+            for future in as_completed(future_to_key):
+                key = future_to_key[future]
+                if response := future.result():
+                    results[key] = [item.strip('- ') for item in response.split('\n') if item.strip('- ')]
+                else:
+                    results[key] = []
+        
         return results
 
-    def get_youtube_videos(self, topic: str, description: str, num_videos: int = 3) -> List[VideoContent]:
+    def get_youtube_videos(self, topic: str, num_videos: int = 3) -> List[VideoContent]:
+        cache_key = f"youtube_{topic}_{num_videos}"
+        if cached := self.cache.get(cache_key):
+            return cached
+            
         try:
-            keyword_prompt = f"Generate 3 different search phrases (5-7 words each) for finding educational videos about: {topic}\nDescription: {description}"
-            if not (keywords_response := self.query_gemini(keyword_prompt)): return []
-            keywords = [k.strip() for k in keywords_response.split('\n') if k.strip()]
-            videos = []
-            for keyword in keywords:
-                search_results = YoutubeSearch(keyword, max_results=num_videos).to_dict()
-                for result in search_results:
-                    video = VideoContent(
-                        url=f"https://youtube.com{result['url_suffix']}",
-                        title=result['title'],
-                        duration=result['duration'],
-                        views=result.get('views', 'N/A')
-                    )
-                    if video not in videos: videos.append(video)
-                sleep(1)
-            return videos[:num_videos]
+            search_results = YoutubeSearch(f"technical tutorial {topic}", max_results=num_videos).to_dict()
+            videos = [
+                VideoContent(
+                    url=f"https://youtube.com{result['url_suffix']}",
+                    title=result['title'],
+                    duration=result['duration'],
+                    views=result.get('views', 'N/A')
+                )
+                for result in search_results
+            ]
+            self.cache.set(cache_key, videos)
+            return videos
         except Exception as e:
             logging.error(f"YouTube search error: {str(e)}")
             return []
 
-    def extract_topics(self, text: str) -> List[Tuple[str, str]]:
-        prompt = """Analyze this syllabus and extract ALL possible topics and subtopics with detailed descriptions.
-        Consider: Main topics, subtopics, technical concepts, practical skills, and industry terminology.
-        Format: "Topic: Detailed description"
-        Ensure comprehensive descriptions with context and relationships."""
-        if not (response := self.query_gemini(prompt + "\n\nContent:\n" + text)): return []
+    def process_topics(self, text: str) -> List[Tuple[str, str]]:
+        cache_key = f"topics_{hashlib.md5(text.encode()).hexdigest()}"
+        if cached := self.cache.get(cache_key):
+            return cached
+            
+        prompt = "Extract technical topics from this syllabus with detailed descriptions. Format: Topic: Description"
+        if not (response := self.query_gemini(prompt + "\n\n" + text)): 
+            return []
+            
         topics = []
         current_topic, current_desc = "", []
+        
         for line in response.split('\n'):
             if ':' in line and not line.startswith(' '):
                 if current_topic and current_desc:
@@ -116,66 +162,78 @@ class SyllabusProcessor:
                 current_topic, current_desc = topic.strip(), [desc.strip()]
             elif line.strip() and current_topic:
                 current_desc.append(line.strip())
+                
         if current_topic and current_desc:
             topics.append((current_topic, ' '.join(current_desc)))
+            
+        self.cache.set(cache_key, topics)
         return topics
 
     def process_syllabus(self, pdf_path: str) -> List[TopicContent]:
-        if not (text := self.extract_text_from_pdf(pdf_path)): return []
-        topics = self.extract_topics(text)
+        if not (text := self.extract_text_from_pdf(pdf_path)):
+            return []
+            
+        topics = self.process_topics(text)
         results = []
-        for topic, description in topics:
-            logging.info(f"Processing: {topic}")
-            detailed_content = self.get_detailed_topic_content(topic, description)
-            videos = self.get_youtube_videos(topic, description)
-            topic_content = TopicContent(
-                topic=topic, description=description,
-                learning_objectives=detailed_content.get('learning_objectives', []),
-                key_concepts=detailed_content.get('key_concepts', []),
-                practical_applications=detailed_content.get('practical_applications', []),
-                related_topics=detailed_content.get('related_topics', []),
-                recommended_resources=detailed_content.get('recommended_resources', []),
-                videos=videos
-            )
-            results.append(topic_content)
-            sleep(2)
+        
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            future_to_topic = {
+                executor.submit(self.process_topic_content, topic, desc): (topic, desc) 
+                for topic, desc in topics
+            }
+            
+            for future in as_completed(future_to_topic):
+                topic, desc = future_to_topic[future]
+                detailed_content = future.result()
+                videos = self.get_youtube_videos(topic)
+                
+                results.append(TopicContent(
+                    topic=topic,
+                    description=desc,
+                    learning_objectives=detailed_content.get('learning_objectives', []),
+                    key_concepts=detailed_content.get('key_concepts', []),
+                    practical_applications=detailed_content.get('practical_applications', []),
+                    related_topics=detailed_content.get('related_topics', []),
+                    recommended_resources=detailed_content.get('recommended_resources', []),
+                    videos=videos
+                ))
+                
         return results
 
 def save_results(results: List[TopicContent], output_path: str):
-    try:
-        json_data = [{
-            "topic": r.topic, "description": r.description,
-            "learning_objectives": r.learning_objectives,
-            "key_concepts": r.key_concepts,
-            "practical_applications": r.practical_applications,
-            "related_topics": r.related_topics,
-            "recommended_resources": r.recommended_resources,
-            "videos": [vars(v) for v in r.videos]
-        } for r in results]
+    json_data = [{
+        "topic": r.topic, "description": r.description,
+        "learning_objectives": r.learning_objectives,
+        "key_concepts": r.key_concepts,
+        "practical_applications": r.practical_applications,
+        "related_topics": r.related_topics,
+        "recommended_resources": r.recommended_resources,
+        "videos": [vars(v) for v in r.videos]
+    } for r in results]
+    
+    with open(f"{output_path}.json", "w", encoding="utf-8") as f:
+        json.dump(json_data, f, indent=2)
         
-        with open(f"{output_path}.json", "w", encoding="utf-8") as f:
-            json.dump(json_data, f, indent=2)
-            
-        with open(f"{output_path}.txt", "w", encoding="utf-8") as f:
-            for r in results:
-                f.write(f"Topic: {r.topic}\nDescription: {r.description}\n\n")
-                f.write("Learning Objectives:\n" + "\n".join(f"- {obj}" for obj in r.learning_objectives) + "\n\n")
-                f.write("Key Concepts:\n" + "\n".join(f"- {concept}" for concept in r.key_concepts) + "\n\n")
-                f.write("Practical Applications:\n" + "\n".join(f"- {app}" for app in r.practical_applications) + "\n\n")
-                f.write("Related Topics:\n" + "\n".join(f"- {topic}" for topic in r.related_topics) + "\n\n")
-                f.write("Recommended Resources:\n" + "\n".join(f"- {resource}" for resource in r.recommended_resources) + "\n\n")
-                f.write("Recommended Videos:\n")
-                for v in r.videos:
-                    f.write(f"- {v.title}\n  Duration: {v.duration}\n  Views: {v.views}\n  URL: {v.url}\n")
-                f.write("\n" + "="*80 + "\n\n")
-        logging.info(f"Results saved to {output_path}.json and {output_path}.txt")
-    except Exception as e:
-        logging.error(f"Save error: {str(e)}")
+    with open(f"{output_path}.txt", "w", encoding="utf-8") as f:
+        for r in results:
+            sections = [
+                ("Topic", r.topic),
+                ("Description", r.description),
+                ("Learning Objectives", "\n".join(f"- {x}" for x in r.learning_objectives)),
+                ("Key Concepts", "\n".join(f"- {x}" for x in r.key_concepts)),
+                ("Practical Applications", "\n".join(f"- {x}" for x in r.practical_applications)),
+                ("Related Topics", "\n".join(f"- {x}" for x in r.related_topics)),
+                ("Recommended Resources", "\n".join(f"- {x}" for x in r.recommended_resources)),
+                ("Videos", "\n".join(f"- {v.title}\n  Duration: {v.duration}\n  Views: {v.views}\n  URL: {v.url}" for v in r.videos))
+            ]
+            f.write("\n".join(f"{title}:\n{content}\n" for title, content in sections))
+            f.write("\n" + "="*80 + "\n\n")
 
 def main():
-    PDF_PATH = "PDF_PATH"
+    PDF_PATH = "path/to/your/syllabus.pdf"
     API_KEY = "YOUR_API_KEY"
-    OUTPUT_PATH = "detailed_syllabus_content"
+    OUTPUT_PATH = "technical_syllabus_content"
+    
     processor = SyllabusProcessor(API_KEY)
     if results := processor.process_syllabus(PDF_PATH):
         save_results(results, OUTPUT_PATH)
