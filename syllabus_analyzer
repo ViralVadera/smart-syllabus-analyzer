@@ -66,7 +66,8 @@ class SyllabusProcessor:
         if cached := self.cache.get(cache_key):
             return cached
         try:
-            if not os.path.exists(pdf_path): raise FileNotFoundError(f"PDF not found: {pdf_path}")
+            if not os.path.exists(pdf_path): 
+                raise FileNotFoundError(f"PDF not found: {pdf_path}")
             md_text = pymupdf4llm.to_markdown(pdf_path)
             self.cache.set(cache_key, md_text)
             return md_text
@@ -92,16 +93,105 @@ class SyllabusProcessor:
                     self.cache.set(cache_key, content)
                     return content
             except requests.exceptions.RequestException as e:
-                if attempt < max_retries - 1: sleep(1)
+                if attempt < max_retries - 1:
+                    sleep(1)
         return None
 
+    def extract_topic_from_description(self, description: str) -> str:
+        """Extract a concise topic title from a description using Gemini."""
+        # Clean the description
+        description = description.replace('**', '').strip()
+        if description.startswith('This module covers '):
+            description = description.replace('This module covers ', '')
+        if description.startswith('This section focuses on '):
+            description = description.replace('This section focuses on ', '')
+
+        prompt = f"""Given this technical description, provide ONLY a concise 2-4 word topic title that captures the main subject. 
+        Return ONLY the title, no additional text or explanation.
+        
+        Description: {description}"""
+        
+        if topic := self.query_gemini(prompt):
+            return topic.strip()
+        return "Unknown Topic"
+
+    def process_topics(self, text: str) -> List[Tuple[str, str]]:
+        cache_key = f"topics_{hashlib.md5(text.encode()).hexdigest()}"
+        if cached := self.cache.get(cache_key):
+            return cached
+        
+        prompt = """Extract technical topics and their descriptions from this syllabus. 
+                    Format each entry as:
+                    Topic: [The detailed description of the topic]
+                    Description: [The detailed description of the topic]"""
+        
+        if not (response := self.query_gemini(prompt + "\n\n" + text)): 
+            return []
+        
+        topics = []
+        current_description = ""
+        
+        for line in response.split('\n'):
+            print(line)
+            line = line.strip()
+            if not line:
+                continue
+            
+            line = line.replace('**', '').strip()
+            
+            if line.startswith('Description:'):
+                if current_description:
+                    # Process previous description if exists
+                    topic = self.extract_topic_from_description(current_description)
+                    if topic and not topic.lower() in ['topic', 'description']:
+                        topics.append((topic, current_description))
+                
+                # Start new description
+                current_description = line.replace('Description:', '').strip()
+            elif current_description:
+                current_description += " " + line
+        
+        # Process the last description
+        if current_description:
+            topic = self.extract_topic_from_description(current_description)
+            if topic and not topic.lower() in ['topic', 'description']:
+                topics.append((topic, current_description))
+        
+        self.cache.set(cache_key, topics)
+        return topics
+
+    def get_youtube_videos(self, topic: str, num_videos: int = 3) -> List[VideoContent]:
+        """Updated to use clean topic title for better search results"""
+        cache_key = f"youtube_{topic}_{num_videos}"
+        if cached := self.cache.get(cache_key):
+            return cached
+            
+        try:
+            # Use the topic directly for more relevant results
+            search_results = YoutubeSearch(f"tutorial {topic}", max_results=num_videos).to_dict()
+            videos = [
+                VideoContent(
+                    url=f"https://youtube.com{result['url_suffix']}",
+                    title=result['title'],
+                    duration=result['duration'],
+                    views=result.get('views', 'N/A')
+                )
+                for result in search_results
+            ]
+            self.cache.set(cache_key, videos)
+            return videos
+        except Exception as e:
+            logging.error(f"YouTube search error: {str(e)}")
+            return []
+
     def process_topic_content(self, topic: str, description: str) -> Dict:
+        """Updated to use the extracted topic title"""
         prompts = {
-            "learning_objectives": f"List 5-7 specific learning objectives for: {topic}",
-            "key_concepts": f"List 8-10 key concepts for: {topic}",
-            "practical_applications": f"List 5-7 practical applications of: {topic}",
-            "related_topics": f"List 6-8 related topics to: {topic}",
-            "recommended_resources": f"List 5-7 learning resources for: {topic}"
+            "learning_objectives": f"List 5-7 specific learning objectives for {description}:",
+            "key_concepts": f"List 8-10 key concepts for {description}:",
+            "practical_applications": f"List 5-7 practical applications of {description}:",
+            "related_topics": f"List 6-8 related topics to {description}:",
+            "recommended_resources": f"List 5-7 learning resources for {description}:"
         }
         
         results = {}
@@ -120,55 +210,6 @@ class SyllabusProcessor:
         
         return results
 
-    def get_youtube_videos(self, topic: str, num_videos: int = 3) -> List[VideoContent]:
-        cache_key = f"youtube_{topic}_{num_videos}"
-        if cached := self.cache.get(cache_key):
-            return cached
-            
-        try:
-            search_results = YoutubeSearch(f"technical tutorial {topic}", max_results=num_videos).to_dict()
-            videos = [
-                VideoContent(
-                    url=f"https://youtube.com{result['url_suffix']}",
-                    title=result['title'],
-                    duration=result['duration'],
-                    views=result.get('views', 'N/A')
-                )
-                for result in search_results
-            ]
-            self.cache.set(cache_key, videos)
-            return videos
-        except Exception as e:
-            logging.error(f"YouTube search error: {str(e)}")
-            return []
-
-    def process_topics(self, text: str) -> List[Tuple[str, str]]:
-        cache_key = f"topics_{hashlib.md5(text.encode()).hexdigest()}"
-        if cached := self.cache.get(cache_key):
-            return cached
-            
-        prompt = "Extract technical topics from this syllabus with detailed descriptions. Format: Topic: Description"
-        if not (response := self.query_gemini(prompt + "\n\n" + text)): 
-            return []
-            
-        topics = []
-        current_topic, current_desc = "", []
-        
-        for line in response.split('\n'):
-            if ':' in line and not line.startswith(' '):
-                if current_topic and current_desc:
-                    topics.append((current_topic, ' '.join(current_desc)))
-                topic, desc = line.split(':', 1)
-                current_topic, current_desc = topic.strip(), [desc.strip()]
-            elif line.strip() and current_topic:
-                current_desc.append(line.strip())
-                
-        if current_topic and current_desc:
-            topics.append((current_topic, ' '.join(current_desc)))
-            
-        self.cache.set(cache_key, topics)
-        return topics
-
     def process_syllabus(self, pdf_path: str) -> List[TopicContent]:
         if not (text := self.extract_text_from_pdf(pdf_path)):
             return []
@@ -185,7 +226,7 @@ class SyllabusProcessor:
             for future in as_completed(future_to_topic):
                 topic, desc = future_to_topic[future]
                 detailed_content = future.result()
-                videos = self.get_youtube_videos(topic)
+                videos = self.get_youtube_videos(desc)
                 
                 results.append(TopicContent(
                     topic=topic,
@@ -202,7 +243,7 @@ class SyllabusProcessor:
 
 def save_results(results: List[TopicContent], output_path: str):
     json_data = [{
-        "topic": r.topic, "description": r.description,
+        "topic": r.description,
         "learning_objectives": r.learning_objectives,
         "key_concepts": r.key_concepts,
         "practical_applications": r.practical_applications,
@@ -217,8 +258,7 @@ def save_results(results: List[TopicContent], output_path: str):
     with open(f"{output_path}.txt", "w", encoding="utf-8") as f:
         for r in results:
             sections = [
-                ("Topic", r.topic),
-                ("Description", r.description),
+                ("Topic", r.description),
                 ("Learning Objectives", "\n".join(f"- {x}" for x in r.learning_objectives)),
                 ("Key Concepts", "\n".join(f"- {x}" for x in r.key_concepts)),
                 ("Practical Applications", "\n".join(f"- {x}" for x in r.practical_applications)),
@@ -230,8 +270,8 @@ def save_results(results: List[TopicContent], output_path: str):
             f.write("\n" + "="*80 + "\n\n")
 
 def main():
-    PDF_PATH = "path/to/your/syllabus.pdf"
-    API_KEY = "YOUR_API_KEY"
+    PDF_PATH = "C:/Users/viral/OneDrive/Desktop/test.pdf"
+    API_KEY = "AIzaSyAbikd5QIJMI4pKR3Izb8jcuT0rJa4Nz8w"
     OUTPUT_PATH = "technical_syllabus_content"
     
     processor = SyllabusProcessor(API_KEY)
