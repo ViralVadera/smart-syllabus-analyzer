@@ -62,7 +62,6 @@ The tool generates two types of output files:
 ```json
 {
   "topic": "Topic Name",
-  "description": "Detailed description",
   "learning_objectives": ["objective1", "objective2", ...],
   "key_concepts": ["concept1", "concept2", ...],
   "practical_applications": ["application1", "application2", ...],
