@@ -270,8 +270,8 @@ def save_results(results: List[TopicContent], output_path: str):
             f.write("\n" + "="*80 + "\n\n")
 
 def main():
-    PDF_PATH = "C:/Users/viral/OneDrive/Desktop/test.pdf"
-    API_KEY = "AIzaSyAbikd5QIJMI4pKR3Izb8jcuT0rJa4Nz8w"
+    PDF_PATH = "PDF_PATH"
+    API_KEY = "YOUR_GEMINI_API"
     OUTPUT_PATH = "technical_syllabus_content"
     
     processor = SyllabusProcessor(API_KEY)
